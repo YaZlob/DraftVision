@@ -1,0 +1,43 @@
+components:
+  model:
+    type: DfineDetecor
+    components:
+      backbone:
+        type: HGNetV2
+        params:
+          name: 'B2'
+          return_idx: [1, 2, 3]
+          freeze_at: -1
+          freeze_norm: False
+          use_lab: True
+      
+      encoder:
+        type: DfineEncoder
+        params:
+          in_channels: [384, 768, 1536]
+          hidden_dim: 256
+          depth_mult: 0.67
+
+      decoder:
+        type: DfineDecoder
+        params:
+          num_layers: 4  # 4 5 6
+          eval_idx: -1  # -2 -3 -4
+
+  optimizer:
+    type: adamw
+    params:
+      lr: 0.0002
+      betas: [0.9, 0.999]
+      weight_decay: 0.0001
+      pgassignment:
+        -
+          pattern: '^(?=.*backbone)(?!.*norm|bn).*$'
+          lr: 0.00002
+        -
+          pattern: '^(?=.*backbone)(?=.*norm|bn).*$'
+          lr: 0.00002
+          weight_decay: 0.
+        -
+          pattern: '^(?=.*(?:encoder|decoder))(?=.*(?:norm|bn|bias)).*$'
+          weight_decay: 0.

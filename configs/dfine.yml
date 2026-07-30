@@ -1,0 +1,84 @@
+defaults:
+  - dfine/base.yml
+  - dfine/dfine_s.yml
+  - dataset/coco.yml
+
+name: dfine_s_debug
+task: object_detection
+outdir: null
+
+components:
+  model:
+    components:
+      backbone:
+        type: HGNetV2
+      encoder:
+        type: DfineEncoder
+      decoder:
+        type: DfineDecoder
+        params:
+          num_classes: "${n_classes}"
+      postprocessor:
+        type: DfinePostprocessor
+        params:
+          num_classes: "${n_classes}"
+
+  loss:
+    type: DfineCriterion
+    params:
+      weight_dict:
+        loss_vfl: 1
+        loss_bbox: 5
+        loss_giou: 2
+        loss_fgl: 0.15
+        loss_ddf: 1.5
+      losses: ["vfl", "boxes", "local"]
+      alpha: 0.75
+      gamma: 2.0
+      num_classes: "${n_classes}"
+      reg_max: 32
+    components:
+      matcher:
+        type: HungarianMatcher
+        params:
+          weight_dict:
+            cost_class: 2
+            cost_bbox: 5
+            cost_giou: 2
+          alpha: 0.25
+          gamma: 2.0
+    
+  metric:
+    type: MergedMetrics
+    components:
+      coco:
+        type: FasterCocoEval
+        params:
+          coco_gt: "${val_ann}"
+      
+      obj_det_cls:
+        type: ObjDetMetrics
+        params:
+          conf_thresh: 0.5
+          iou_thresh: 0.5
+  
+  scheduler:
+    type: constant_with_warmup
+    params:
+      num_warmup_steps: 200
+
+saving:
+  monitors:
+    - name: best
+      filename: best.pth
+      monitor: average_metrics.AP50:95
+      mode: max
+
+  save_last: true
+  last_filename: "last.pth"
+
+runtime:
+  epochs: 10
+  grad_clip: 0.1
+  visualize: true
+  print_freq: 250

@@ -1,0 +1,103 @@
+n_classes: 80
+resolution: [640, 640]
+val_ann: /object_detection/coco2017/annotations/instances_val2017.json
+map_coco: true
+
+components:
+  dataloader:
+    type: torch_dataloader
+
+    train:
+      params:
+        batch_size: 4
+        num_workers: 2
+        shuffle: true
+      components:
+        dataset:
+          type: coco_object_detection_dataset
+          params:
+            img_dir: /object_detection/coco2017/train2017
+            annotation: /object_detection/coco2017/annotations/instances_train2017.json
+            map_coco: "${map_coco}"
+          components:
+            transforms:
+              type: compose
+              components:
+                - type: ConvertBoxes
+                  params:
+                    out_fmt: "xyxy"
+                    absolute: true
+                - type: horizontal_flip
+                  params:
+                    p: 0.5
+                - type: photometric_distort
+                  params:
+                    p: 0.5
+                - type: random_iou_crop
+                  params:
+                    p: 0.5
+                - type: affine
+                  params:
+                    p: 0.5
+                    degrees: 25
+                    translate: [0.15, 0.15]
+                    scale: [0.8, 1.2]
+                    shear: 10
+                    fill: 
+                      image: 0
+                - type: resize
+                  params:
+                    size: "${resolution}"
+                - type: sanitize_bounding_boxes
+                  params: 
+                    min_size: 1
+                - type: ConvertBoxes
+                  params:
+                    out_fmt: "cxcywh"
+                    absolute: false
+                - type: ConvertImage
+                  params:
+                    dtype: "float32"
+                    scale: true
+                    
+        collate_fn:
+          type: DetectorCollateFn
+          params:
+            resolution: "${resolution}"       
+            scale_factor: 0.75
+            use_upper_scale: true
+            base_res_repeat: 6
+
+    val:
+      params:
+        batch_size: 16
+        num_workers: 4
+        shuffle: false
+      
+      components:
+        dataset:
+          type: coco_object_detection_dataset
+          params:
+            img_dir: /object_detection/coco2017/val2017
+            annotation: "${val_ann}"
+          components:
+            transforms:
+              type: compose
+              components:
+                - type: resize
+                  params:
+                    size: "${resolution}"
+                - type: ConvertBoxes
+                  params:
+                    out_fmt: "xyxy"
+                    absolute: true
+                - type: ConvertImage
+                  params:
+                    dtype: "float32"
+                    scale: true
+  
+        collate_fn:
+          type: BaseDetectorCollateFn
+
+runtime:
+  map_coco: "${map_coco}"
