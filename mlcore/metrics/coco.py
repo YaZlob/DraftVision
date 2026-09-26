@@ -13,9 +13,8 @@ except ImportError:
 
 
 from pathlib import Path
-from ._base import BaseMetricTracker
+from .metrics import BaseMetricTracker
 from mlcore.core import COMPONENTS, ComponentType, Task
-from mlcore.data._coco import targetcls2coco
 
 
 # TODO добавить сегментацию и ключевые точки, пока только детекция
@@ -28,7 +27,7 @@ from mlcore.data._coco import targetcls2coco
 )
 class CocoEvaluator(BaseMetricTracker):
 
-    metric_names = [
+    _avg_metrics_names = [
         "AP50:95",
         "AP50",
         "AP75",
@@ -82,11 +81,11 @@ class CocoEvaluator(BaseMetricTracker):
     def reset(self):
         self._evaluator.cleanup()
 
-    def average(self) -> dict:
+    def average(self) -> dict[str:float]:
         metrics = self._evaluator.coco_eval["bbox"].stats.tolist()
-        result = {}
-        for idx, name in enumerate(self.metric_names):
-            result[name] = metrics[idx]
+        result = {
+            name: metrics[idx] for idx, name in enumerate(self._avg_metrics_names)
+        }
         return result
 
     def per_cls_metrics(self) -> dict:

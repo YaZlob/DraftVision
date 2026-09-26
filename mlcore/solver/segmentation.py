@@ -1,8 +1,7 @@
 import torch
-
 import logging
 from torch.nn.utils import clip_grad_norm_
-from ._solver import BaseSolver, metrics
+from .solver import BaseSolver, metrics
 
 logger = logging.getLogger()
 

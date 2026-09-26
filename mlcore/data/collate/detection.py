@@ -2,7 +2,8 @@ import torch
 import random
 import warnings
 import torch.nn.functional as F
-from mlcore.core import COMPONENTS, ComponentType, Task
+from mlcore.core import COMPONENTS, ComponentType, Task, CollateFn
+
 from .._contracts import DetectionTarget
 
 
@@ -56,11 +57,11 @@ class BaseImageBatchCollateFunc:
     supported_tasks=Task.OBJECT_DETECTION,
     description="Detector collate function with image scale",
 )
-class ImageBatchCollateFunc(BaseImageBatchCollateFunc):
+class ImageBatchCollateFunc(BaseImageBatchCollateFunc, CollateFn):
     def __init__(
         self,
         resolution: tuple[int, int],
-        scale_factor: float | None = 0.75,
+        scale_factor: float = 0.75,
         use_upper_scale: bool = True,
         base_res_repeat: int | None = 3,
     ):
@@ -68,16 +69,20 @@ class ImageBatchCollateFunc(BaseImageBatchCollateFunc):
             "Scales only images, keeps boundig boxes the same!\n"
             "Critical if detector works with unnormalized coodinates"
         )
+        assert 0.25 <= scale_factor < 1.0
+
         self.resolution = resolution
-        self.scales = (
-            generate_scales(resolution, base_res_repeat, scale_factor, use_upper_scale)
-            if scale_factor
-            else None
+        self.scales = generate_scales(
+            resolution, base_res_repeat, scale_factor, use_upper_scale
         )
+        self._scale = True
+
+    def disable(self) -> None:
+        self._scale = False
 
     def __call__(self, items: list[tuple[torch.Tensor, DetectionTarget]]):
         images, targets = super().__call__(items)
-        if self.scales:
+        if self._scale:
             sz = random.choice(self.scales)
             images = F.interpolate(images, size=sz)
 

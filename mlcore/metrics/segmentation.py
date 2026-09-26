@@ -3,19 +3,19 @@ import evaluate
 from collections.abc import Mapping
 
 from mlcore.core import COMPONENTS, ComponentType, Task
-from ._base import BaseMetricTracker
-
-COMPONENT_NAME = "seg_metrics"
+from .metrics import BaseMetricTracker
 
 
 @COMPONENTS.register(
-    name=COMPONENT_NAME,
+    name="seg_metrics",
     ctype=ComponentType.METRIC,
     supported_tasks=Task.SEMANTIC_SEGMENTATION,
     provider="huggingface",
     description="Class for segmentation metrics evaluation",
 )
 class SegmentationMetricsTracker(BaseMetricTracker):
+    _avg_metrics_names = ["mean_iou", "mean_acc"]
+
     def __init__(
         self,
         n_classes: int,

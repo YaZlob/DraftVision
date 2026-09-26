@@ -5,13 +5,12 @@ from PIL import Image
 from pathlib import Path
 from typing import TypedDict
 from collections import defaultdict
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from mlcore.core import COMPONENTS, ComponentType, Task, BOXFORMAT, IMGEXT
 
-from ._coco import coco2targetcls
 from ._dataset import Dataset
-from ._is_valid import validate_coco_ann
-from ._contracts import DetectionTarget, _prepare_det_target
+from mlcore.utils.coco import validate_coco_ann, coco2targetcls
+from ._contracts import DetectionTarget, _prepare_det_target, load_yolo_ann
 
 
 class DetectionSample(TypedDict):
@@ -35,9 +34,8 @@ class COCOStyleDataset(Dataset):
         annotation: str | Path,
         transforms: Callable | None = None,
         map_coco: bool = False,
+        mix_transform_config: Mapping | None = None,
     ) -> None:
-
-        super().__init__(transforms=transforms)
 
         # аннотация COCO2017 начинается с 1 + имеет пропуски, это
         # неудобно для обучения модели. Надо закодировать cat_id
@@ -52,6 +50,12 @@ class COCOStyleDataset(Dataset):
             raise ValueError(f"`annotation` must be a real file: {self.annotation}")
 
         self.samples: list[DetectionSample] = self._parse_coco_ann()
+
+        super().__init__(
+            task=Task.OBJECT_DETECTION,
+            transforms=transforms,
+            mix_transform_config=mix_transform_config,
+        )
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -145,6 +149,7 @@ class YoloStyleDataset(Dataset):
         transforms: Callable | None = None,
         in_box_fmt: BOXFORMAT = "cxcywh",
         img_ext: str = ".jpg",
+        mix_transform_config: Mapping | None = None,
     ):
 
         warnings.warn("Only for training! Build coco style annotation for validation!")
@@ -152,7 +157,6 @@ class YoloStyleDataset(Dataset):
             raise ValueError(
                 f"Unsupported input bounding box format: {in_box_fmt}, supports {BOXFORMAT}"
             )
-
         assert img_ext in IMGEXT
 
         self.img_dir = Path(img_dir)
@@ -165,18 +169,13 @@ class YoloStyleDataset(Dataset):
         if not self.ann_dir.is_dir():
             raise ValueError(f"`ann_dir` must be a real directory: {self.ann_dir}")
 
-        self.transforms = transforms
         self.index: list[tuple[int, Path, Path]] = self._make_index()
 
-    @staticmethod
-    def _load_ann(path2ann: str) -> tuple[list[int], list[tuple]]:
-        labels, boxes = [], []
-        with open(path2ann, mode="r", encoding="utf-8") as f:
-            for line in f.readlines():
-                cls_id, *coords = line.split(" ")
-                labels.append(int(cls_id))
-                boxes.append(list(map(float, coords)))
-        return labels, boxes
+        super().__init__(
+            task=Task.OBJECT_DETECTION,
+            transforms=transforms,
+            mix_transform_config=mix_transform_config,
+        )
 
     # Изображение есть, аннотации нет -> ошибка или нет целевых классов?
     # Пока сделано через аннотацию. Если для изображения аннотации нет, то
@@ -205,7 +204,7 @@ class YoloStyleDataset(Dataset):
         with Image.open(img) as image:
             image = image.convert("RGB")
 
-        labels, boxes = self._load_ann(ann)
+        labels, boxes = load_yolo_ann(ann)
         # Для совместисмости с COCO, `image_id` в действительности не используется
         target = _prepare_det_target(
             boxes=boxes,

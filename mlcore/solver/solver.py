@@ -2,11 +2,11 @@ import os
 import logging
 import atexit
 import torch
+import time
 import torch.nn as nn
 from torch.utils.tensorboard import SummaryWriter
-from typing import Any
+from typing import Any, TypedDict
 from pathlib import Path
-from abc import ABC, abstractmethod
 from functools import cached_property
 
 import mlcore.data
@@ -27,8 +27,9 @@ from mlcore.core import (
     load_experiment_config,
     CONFIGNAME,
     BuildComponentError,
+    SolverTemplate,
 )
-from mlcore.training.checkpoint import CheckpointManager
+from mlcore.training.policy import CALLBACKS
 
 logger = logging.getLogger()
 
@@ -41,7 +42,16 @@ def _validate_provided_dir(folder: str | Path | None) -> Path:
     return path_obj
 
 
-class BaseSolver(ABC):
+class State(TypedDict):
+    model: dict
+    epoch: int
+    optimizer: dict
+    monitoring: dict
+    ema: dict | None
+    scheduler: dict | None
+
+
+class BaseSolver(SolverTemplate):
 
     def __init__(
         self,
@@ -50,29 +60,21 @@ class BaseSolver(ABC):
         tuning: str | Path | None = None,
     ) -> None:
 
+        super().__init__(config, outdir, tuning)
         self._tuning = None
         if tuning and os.path.isfile(tuning):
             self._tuning = Path(tuning)
 
-        self._outdir: Path = outdir
-        self._expdir: Path = None
-        self._config: ExperimentConfig = config
         self._registry: Registry = COMPONENTS
         self._writer: SummaryWriter = None
 
         self._device = "cuda"
         self._last_epoch = 0
-        self._model: nn.Module = None
-        self._ema: nn.Module = None
-        self._optim: nn.Module = None
-        self._scheduler: nn.Module = None
-        self._criterion: nn.Module = None
-        self._metrics_tracker: metrics.BaseMetricTracker = None
-        self._train_dataloader = None
-        self._val_dataloader = None
 
         # auxiliary params
+        self._monitoring: training.MonitorMetricsTracker = None
         self.task: Task = config.task
+        self._callbacks = CALLBACKS
         self._print_freq = config.runtime.get("print_freq", 1000)
 
     def _build_model(self) -> nn.Module:
@@ -81,6 +83,10 @@ class BaseSolver(ABC):
             task=self.task,
         )
         return model
+
+    @property
+    def epoch(self) -> int:
+        return self._last_epoch
 
     @property
     def runtime(self) -> dict:
@@ -170,7 +176,6 @@ class BaseSolver(ABC):
         optim_conf = self._config.require_component(ComponentType.OPTIMIZER)
         optim_prms = optim_conf.params
 
-        # TODO Добавить проверку необходимых параметров обязательных компонентов?
         if "lr" not in optim_prms:
             raise BuildComponentError("`lr` must be specified for optimizer")
 
@@ -244,10 +249,15 @@ class BaseSolver(ABC):
         metrics_tracker = self._registry.build(config=metrics_config, task=self.task)
         return metrics_tracker
 
-    def _build_checkpoint_manager(self) -> CheckpointManager:
-        return CheckpointManager.from_dict(
-            self._config.saving, config_path="config.saving"
-        )
+    def _build_monitoring(self) -> training.MonitorMetricsTracker:
+        return training.MonitorMetricsTracker.from_exp_config(self._config.monitoring)
+
+    def _build_callbacks(self) -> None:
+        if self._monitoring is None:
+            raise RuntimeError("Initialize `monitoring` before building callbacks")
+
+        for i, cbconfig in enumerate(self._config.callbacks):
+            self._callbacks.build(cbconfig, config_path=f"configs.[{i}]", solver=self)
 
     def _build_tb_writer(self) -> SummaryWriter:
         tb_log_dir = self.runtime.get("tb_log_dir", None)
@@ -256,38 +266,38 @@ class BaseSolver(ABC):
         atexit.register(writer.close)
         return writer
 
-    def _state(self) -> dict[str, Any]:
-        return {
-            "model": self._model.state_dict(),
-            "last_epoch": self._last_epoch,
-            "optimizer": self._optim.state_dict(),
-            "scheduler": self._scheduler.state_dict() if self._scheduler else {},
-            "ema": self._ema.state_dict() if self._ema else {},
-            "chkpt": self._checkpoint_manager.state_dict(),
-        }
+    def _state(self) -> State:
+        components_state = State(
+            model=self._model.state_dict(),
+            epoch=self._last_epoch,
+            optimizer=self._optim.state_dict(),
+            monitoring=self._monitoring.state_dict(),
+        )
 
-    def _load_state(self, state: dict[str:Any]):
-        self._last_epoch = state.get("last_epoch")
+        if self._ema:
+            components_state["ema"] = self._ema.state_dict()
+
+        if self._scheduler:
+            components_state["scheduler"] = self._scheduler.state_dict()
+
+        return components_state
+
+    def _load_state(self, state: State) -> None:
+        self._last_epoch = state["epoch"]
         self._model.load_state_dict(state["model"])
         self._optim.load_state_dict(state["optimizer"])
+        self._monitoring.load_state_dict(state["monitoring"])
 
-        # Optional components
         if self._scheduler and "scheduler" in state:
             self._scheduler.load_state_dict(state["scheduler"])
         if self._ema and "ema" in state:
             self._ema.load_state_dict(state["ema"])
-        if "chkpt" in state:
-            self._checkpoint_manager.load_state_dict(state["chkpt"])
 
-    def _save(self, state: dict, checkpoint: str):
-        torch.save(state, self._expdir / checkpoint)
+        logger.info(f"Resume model from {self._last_epoch} epoch\n{self._monitoring}")
 
     @property
     def device(self) -> str:
         return self._device
-
-    def log_time(self, global_step: int) -> bool:
-        return global_step % self._print_freq == 0
 
     @device.setter
     def device(self, value: str):
@@ -295,7 +305,9 @@ class BaseSolver(ABC):
             raise ValueError(f"Unexpected device: {value} expected ['cuda', 'cpu']")
         self._device = value
 
-    # TODO several gpus
+    def log_time(self, global_step: int) -> bool:
+        return global_step % self._print_freq == 0
+
     def train_setup(self) -> None:
         if not torch.cuda.is_available():
             raise RuntimeError("Training works only with cuda available")
@@ -322,7 +334,9 @@ class BaseSolver(ABC):
         self._optim = self._build_optimizer()
         self._scheduler = self._build_scheduler()
         self._metrics_tracker = self._build_metrics_tracker()
-        self._checkpoint_manager = self._build_checkpoint_manager()
+        self._monitoring = self._build_monitoring()
+
+        self._build_callbacks()
 
     def val_setup(self) -> None:
         _log.pylog_config()
@@ -330,7 +344,6 @@ class BaseSolver(ABC):
         self._criterion = self._build_criterion()
         self._val_dataloader = self._build_dataloader("val")
         self._metrics_tracker = self._build_metrics_tracker()
-        self._checkpoint_manager = self._build_checkpoint_manager()
 
     def _training_loop(self) -> dict[str, float]:
         """Run the full training loop"""
@@ -339,12 +352,27 @@ class BaseSolver(ABC):
             raise RuntimeError("Call `train_setup` before start fit model")
 
         for epoch in range(self._last_epoch, self.epochs):
+            logger.info(f"Start {epoch+1:d} epoch")
+
+            self._callbacks.call_hooks(hookname="on_epoch_start")
+
+            self._callbacks.call_hooks(hookname="on_train_start")
+
+            tic = time.perf_counter()
             train_loss = self._train_epoch()
+            elapsed = (time.perf_counter() - tic) / 60
+            logger.info(f"Train step complete in {elapsed:.2f}")
+
+            self._callbacks.call_hooks(hookname="on_train_end")
+            tic = time.perf_counter()
             val_metrics: metrics.ValMetricsOutput = self._val_epoch()
-            self._last_epoch += 1
+            elapsed = (time.perf_counter() - tic) / 60
+            logger.info(f"Val step complete in {elapsed:.2f}, accumulating results ...")
+
+            self._monitoring.update(val_metrics)
 
             msg = (
-                f"Model: {self._model.__class__.__name__} Epoch: [{epoch + 1:3d}/{self.epochs}], "
+                f"Model: {self._model.__class__.__name__} Epoch: [{self._last_epoch:3d}/{self.epochs}], "
                 f"Train Loss: {train_loss:5.3f}"
             )
             self._writer.add_scalar("Loss-Epoch/Train", train_loss, epoch)
@@ -365,17 +393,10 @@ class BaseSolver(ABC):
                 for key, value in val_metrics.average_metrics.items():
                     self._writer.add_scalar(f"Validation/{key}", value, epoch)
 
-            self._checkpoint_manager.save(
-                state=self._state(), metrics=val_metrics, save_callback=self._save
-            )
+            self._callbacks.call_hooks(hookname="on_epoch_end")
+            self._last_epoch += 1
 
-    @abstractmethod
-    def _train_epoch(self, *args, **kwargs) -> float:
-        """Run full training epoch"""
-
-    @abstractmethod
-    def _val_epoch(self, *args, **kwargs) -> metrics.ValMetricsOutput:
-        """Run full validation epoch"""
+        logger.info(f"Training result:\n {val_metrics}")
 
     def fit(self):
         # Prepare experiment directory
@@ -422,23 +443,27 @@ class BaseSolver(ABC):
         solver.val_setup()
         solver.exp_dir = folder
 
+        checkpoints = [
+            file
+            for file in folder.iterdir()
+            if file.name.endswith(".pth") and file.name != "last.pth"
+        ]
+        if not checkpoints:
+            raise ValueError("Provided folder doesn't contain model checkpoints")
+
         logger.info(
             f"Start evaluation for {solver._config.name}, provided checkpoint dir: {folder}"
         )
-        for rule in solver._checkpoint_manager.rules:
-            chkpt = rule.filename
+        for file in checkpoints:
+            chkpt = file.name
             try:
-                state = torch.load(
-                    folder / chkpt, map_location="cpu", weights_only=False
-                )
+                state: State = torch.load(file, map_location="cpu", weights_only=False)
                 solver._model.load_state_dict(state["model"], strict=True)
             except Exception as err:
                 logger.error(f"Load state for {chkpt} err: {err}")
                 continue
 
-            logger.info(
-                f"Checkpoint {chkpt} monitoring {rule.monitor}. Epoch: {state.get('last_epoch')}"
-            )
+            logger.info(f"Checkpoint {chkpt}. Epoch: {state.get('epoch')}")
 
             val_metrics = solver._val_epoch()
             logger.info(val_metrics)

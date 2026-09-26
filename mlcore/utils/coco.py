@@ -5,8 +5,191 @@ from PIL import Image
 from typing import TypedDict
 from pathlib import Path
 from collections import defaultdict
+from collections.abc import Mapping
 from mlcore.core import IMGEXT
-from mlcore.data.detection import YoloStyleDataset, validate_coco_ann
+
+from mlcore.data._contracts import load_yolo_ann
+
+__all__ = ["coco2targetcls", "targetcls2coco", "validate_coco_ann"]
+
+
+mscoco_category2name = {
+    1: "person",
+    2: "bicycle",
+    3: "car",
+    4: "motorcycle",
+    5: "airplane",
+    6: "bus",
+    7: "train",
+    8: "truck",
+    9: "boat",
+    10: "traffic light",
+    11: "fire hydrant",
+    13: "stop sign",
+    14: "parking meter",
+    15: "bench",
+    16: "bird",
+    17: "cat",
+    18: "dog",
+    19: "horse",
+    20: "sheep",
+    21: "cow",
+    22: "elephant",
+    23: "bear",
+    24: "zebra",
+    25: "giraffe",
+    27: "backpack",
+    28: "umbrella",
+    31: "handbag",
+    32: "tie",
+    33: "suitcase",
+    34: "frisbee",
+    35: "skis",
+    36: "snowboard",
+    37: "sports ball",
+    38: "kite",
+    39: "baseball bat",
+    40: "baseball glove",
+    41: "skateboard",
+    42: "surfboard",
+    43: "tennis racket",
+    44: "bottle",
+    46: "wine glass",
+    47: "cup",
+    48: "fork",
+    49: "knife",
+    50: "spoon",
+    51: "bowl",
+    52: "banana",
+    53: "apple",
+    54: "sandwich",
+    55: "orange",
+    56: "broccoli",
+    57: "carrot",
+    58: "hot dog",
+    59: "pizza",
+    60: "donut",
+    61: "cake",
+    62: "chair",
+    63: "couch",
+    64: "potted plant",
+    65: "bed",
+    67: "dining table",
+    70: "toilet",
+    72: "tv",
+    73: "laptop",
+    74: "mouse",
+    75: "remote",
+    76: "keyboard",
+    77: "cell phone",
+    78: "microwave",
+    79: "oven",
+    80: "toaster",
+    81: "sink",
+    82: "refrigerator",
+    84: "book",
+    85: "clock",
+    86: "vase",
+    87: "scissors",
+    88: "teddy bear",
+    89: "hair drier",
+    90: "toothbrush",
+}
+
+# category id from coco to model cls index
+coco2targetcls = {k: i for i, k in enumerate(mscoco_category2name.keys())}
+# from model cls idx back to coco annotation
+targetcls2coco = {v: k for k, v in coco2targetcls.items()}
+
+
+def validate_coco_ann(annotation: dict[str, list]) -> None:
+    if not isinstance(annotation, Mapping):
+        raise ValueError("❌ Error: Top-level structure must be a JSON Object (dict).")
+
+    miss = {"images", "annotations", "categories"}.difference(annotation)
+    if miss:
+        raise ValueError(
+            f"❌ Error: Annotation miss mandatory top-level keys '{miss}'."
+        )
+
+    image_ids = set()
+    category_ids = set()
+
+    fields = [("id", int), ("name", str)]
+    for idx, cat in enumerate(annotation["categories"]):
+        if not isinstance(cat, Mapping):
+            raise ValueError(
+                f"❌ Error: Category entry at index {idx} is not an object."
+            )
+
+        for field, expected_type in fields:
+            if field not in cat:
+                raise ValueError(
+                    f"❌ Error: Category entry at index {idx} missing field '{field}'."
+                )
+
+            elif not isinstance(cat[field], expected_type):
+                raise ValueError(
+                    f"❌ Error: Category field '{field}' must be {expected_type.__name__}."
+                )
+
+        if "id" in cat:
+            category_ids.add(cat["id"])
+
+    fields = [
+        ("id", int),
+        ("file_name", str),
+        ("width", (int, float)),
+        ("height", (int, float)),
+    ]
+    for img in annotation["images"]:
+        if not isinstance(img, Mapping):
+            raise ValueError(f"❌ Error: expected map, got {img}")
+
+        for field, expected_type in fields:
+            if field not in img:
+                raise ValueError(
+                    f"❌ Error: Image entry {img} missing field '{field}'."
+                )
+
+            if not isinstance(img[field], expected_type):
+                raise ValueError(
+                    f"❌ Error: Image field '{field}' must be {expected_type}. {img}"
+                )
+
+        image_ids.add(img["id"])
+
+    fields = [("id", int), ("image_id", int), ("category_id", int), ("bbox", list)]
+    for ann in annotation["annotations"]:
+        if not isinstance(ann, Mapping):
+            raise ValueError(f"❌ Error: Annotation {ann} is not an map.")
+
+        for field, expected_type in fields:
+            if field not in ann:
+                raise ValueError(f"❌ Error: Annotation {ann} missing field '{field}'.")
+            if not isinstance(ann[field], expected_type):
+                raise ValueError(
+                    f"❌ Error: Annotation field '{field}' must be {expected_type}.\n {ann}"
+                )
+
+        if ann["image_id"] not in image_ids:
+            raise RuntimeError(
+                f"❌ Error: Annotation {ann} points to missing image. Id:{ann['image_id']}."
+            )
+        if ann["category_id"] not in category_ids:
+            raise RuntimeError(
+                f"❌ Error: Annotation {ann} points to missing category_id {ann['category_id']}."
+            )
+
+        bbox = ann["bbox"]
+        if len(bbox) != 4:
+            raise ValueError(
+                f"❌ Error: Annotation 'bbox' length must be exactly 4 elements [x, y, w, h].\n{ann}."
+            )
+        if not all(isinstance(coord, (int, float)) for coord in bbox):
+            raise ValueError(
+                f"❌ Error: Annotation 'bbox' must contain only numerical coordinate values.\n {ann}"
+            )
 
 
 class COCO_ANN(TypedDict):
@@ -399,7 +582,7 @@ def yolo_to_coco(
         ann_name = image_path.stem + ".txt"
         ann_path = ann_dir / ann_name
         if ann_path.is_file():
-            labels, boxes = YoloStyleDataset._load_ann(ann_path)
+            labels, boxes = load_yolo_ann(ann_path)
             categories.update(labels)
             for label, box in zip(labels, boxes):
                 cx, cy, w, h = box

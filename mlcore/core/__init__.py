@@ -1,3 +1,4 @@
+from ._template import SolverTemplate, CollateFn
 from ._config import (
     ComponentConfig,
     ComponentVariantConfig,
@@ -6,6 +7,7 @@ from ._config import (
     save_experiment_config,
     _TARGETS,
     CONFIGNAME,
+    CallbackConfig,
 )
 from ._contracts import ComponentType, REQUIRED_COMPONENT_TYPES, Task, BOXFORMAT, IMGEXT
 from ._errors import (
@@ -16,6 +18,7 @@ from ._errors import (
     CoreError,
     RegistrationError,
 )
+from ._callback import CallBackRegistry, Callback
 from ._registry import COMPONENTS, ComponentSpec, Registry
 
 __all__ = [
@@ -33,6 +36,11 @@ __all__ = [
     "RegistrationError",
     "REQUIRED_COMPONENT_TYPES",
     "Registry",
+    "SolverTemplate",
+    "CollateFn",
+    "Callback",
+    "CallBackRegistry",
+    "CallbackConfig",
     "Task",
     "load_experiment_config",
     "save_experiment_config",

@@ -147,6 +147,7 @@ def build_random_iou_crop(**params: Any):
     return apply_with_probability(v2.RandomIoUCrop(**params), p)
 
 
+# Default parameters: min_size: float = 1.0, min_area: float = 1.0
 @COMPONENTS.register(
     "sanitize_bounding_boxes", ctype=ComponentType.TRANSFORMS, provider="torchvision"
 )
@@ -171,7 +172,7 @@ def build_to_dtype(**params: Any):
     "ToImage",
     ctype=ComponentType.TRANSFORMS,
     provider="torcvision",
-    description="Convert PIL image into tv_tensor.Image",
+    description="Convert tensor, np.array, PIL.Image into tv_tensors.Image",
 )
 def build_ToImage():
     return v2.ToImage()

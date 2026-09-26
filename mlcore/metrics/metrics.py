@@ -1,9 +1,27 @@
+from __future__ import annotations
+
 from typing import Any
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
+from mlcore.core import COMPONENTS, ComponentType, Task
 
 
 class BaseMetricTracker(ABC):
+
+    def __init_subclass__(cls, **kwargs):
+        super().__init_subclass__(**kwargs)
+        avg_metrics_names: list[str] = getattr(cls, "_avg_metrics_names", None)
+        if avg_metrics_names is None:
+            raise AttributeError(
+                f"Class {cls.__name__} must define 'avg_metrics_names'"
+            )
+
+        if not isinstance(avg_metrics_names, (list, tuple)):
+            raise ValueError()
+
+        if not all([isinstance(item, str) for item in avg_metrics_names]):
+            raise ValueError
+
     @abstractmethod
     def reset(self) -> None:
         """Clear internal state buffer"""
@@ -34,7 +52,7 @@ class BaseMetricTracker(ABC):
 
 @dataclass(frozen=True, slots=True)
 class ValMetricsOutput:
-    loss: float | None
+    loss: float | None = None
     average_metrics: dict[str, float] = field(default_factory=dict)
     per_cls_metrics: dict[str, dict[str | int : float]] | None = field(
         default_factory=dict
@@ -92,3 +110,56 @@ class ValMetricsOutput:
                 )
 
         return msg
+
+
+@COMPONENTS.register(
+    "MergedMetrics",
+    ctype=ComponentType.METRIC,
+    supported_tasks=[
+        Task.CLASSIFICATION,
+        Task.OBJECT_DETECTION,
+        Task.SEMANTIC_SEGMENTATION,
+    ],
+    description="Merge several metrics into one",
+)
+class MergedMetrics(BaseMetricTracker):
+    _avg_metrics_names = ["temp"]  # Just to pass validation
+
+    def __init__(self, **trackers: BaseMetricTracker):
+        if not trackers:
+            raise ValueError("MergedMetrics requires at least one metric")
+
+        self._avg_metrics_names = []
+        for name, tracker in trackers.items():
+            if not isinstance(tracker, BaseMetricTracker):
+                raise ValueError(
+                    f"Metric {name} must inherit BaseMetricTracker, got {tracker}"
+                )
+
+            self._avg_metrics_names.extend(tracker._avg_metrics_names)
+
+        self._trackers = trackers
+
+    def reset(self):
+        for tracker in self._trackers.values():
+            tracker.reset()
+
+    def update(self, predict, gt):
+        for tracker in self._trackers.values():
+            tracker.update(predict, gt)
+
+    def compute(self):
+        for tracker in self._trackers.values():
+            tracker.compute()
+
+    def average(self):
+        results = {}
+        for tracker in self._trackers.values():
+            results.update(tracker.average())
+        return results
+
+    def per_cls_metrics(self):
+        results = {}
+        for tracker in self._trackers.values():
+            results.update(tracker.per_cls_metrics())
+        return results

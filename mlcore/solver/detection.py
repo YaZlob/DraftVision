@@ -1,9 +1,8 @@
 import torch
 import logging
-import torch.nn.functional as F
 from torch.nn.utils import clip_grad_norm_
-from ._solver import BaseSolver, metrics
-from mlcore.data._coco import targetcls2coco
+from .solver import BaseSolver, metrics
+from mlcore.utils.coco import targetcls2coco
 from mlcore.utils.visuzlize import save_samples
 
 logger = logging.getLogger()
@@ -122,7 +121,6 @@ class DetectionSolver(BaseSolver):
             # Targets: list[dict] with keys in coco style from annotation.
             # !Note! Targets scaled to `target resolution` from augmentation
             predicts = model(samples, orig_sizes=orig_sizes)
-            # TODO Сохранять предикты, а не таргеты?
             if global_step == 0 and self.visualize:
                 save_samples(
                     samples,

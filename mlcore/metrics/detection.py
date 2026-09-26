@@ -14,7 +14,7 @@ from pathlib import Path
 from collections import defaultdict
 from torchvision.ops import box_iou
 
-from ._base import BaseMetricTracker
+from .metrics import BaseMetricTracker
 from mlcore.core import COMPONENTS, ComponentType, Task
 
 logger = logging.getLogger()
@@ -32,6 +32,8 @@ class Metrics(TypedDict):
     description="Computes general metrics such as <f1, recall, precison, iou>",
 )
 class ObjectDetMetricsTracker(BaseMetricTracker):
+    _avg_metrics_names = ["f1", "precision", "recall"]
+
     def __init__(
         self,
         conf_thresh=0.5,

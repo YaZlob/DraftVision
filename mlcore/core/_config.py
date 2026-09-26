@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import os
 import yaml
 import copy
@@ -36,7 +38,7 @@ def _parse_nested_components(
     data: Mapping[str, Any] | list[Any],
     config_path: str,
     parent_ctype: ComponentType,
-) -> dict[str, "ComponentConfig"] | list["ComponentConfig"]:
+) -> dict[str, ComponentConfig] | list[ComponentConfig]:
 
     if isinstance(data, list):
         parsed_items: list[ComponentConfig] = []
@@ -68,25 +70,55 @@ def _parse_nested_components(
 
 
 def _iter_components(
-    components: Mapping[str, "ComponentConfig"] | list["ComponentConfig"],
-) -> Iterable["ComponentConfig"]:
+    components: Mapping[str, ComponentConfig] | list[ComponentConfig],
+) -> Iterable[ComponentConfig]:
     if isinstance(components, Mapping):
         return components.values()
     return components
 
 
 def _components_to_dict(
-    components: Mapping[str, "ComponentConfig"] | list["ComponentConfig"],
+    components: Mapping[str, ComponentConfig] | list[ComponentConfig],
 ) -> dict[str, Any] | list[dict[str, Any]]:
     if isinstance(components, Mapping):
         return {role: config.to_dict() for role, config in components.items()}
     return [config.to_dict() for config in components]
 
 
+@dataclass(frozen=True, slots=True)
+class CallbackConfig:
+
+    type: str
+    params: dict[str, Any] = field(default_factory=dict)
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any], config_path: str) -> CallbackConfig:
+
+        data = _validate_mapping(data, config_path)
+        unknown = set(data).difference({"type", "params"})
+        if unknown:
+            keys = ", ".join(sorted(unknown))
+            raise ConfigurationError(f"{config_path} contains unknown fields: {keys}")
+
+        name = data.get("type")
+        if not isinstance(name, str) or not name.strip():
+            raise ConfigurationError(f"{config_path}.type must be a non-empty string")
+
+        params = data.get("params", {})
+        params = _validate_mapping(params, f"{config_path}.params")
+        return cls(type=name, params=dict(params))
+
+    def to_dict(self) -> dict[str, Any]:
+        result: dict[str, Any] = {"type": self.type}
+        if self.params:
+            result["params"] = dict(self.params)
+        return result
+
+
 @dataclass(slots=True)
 class ComponentVariantConfig:
     params: dict[str, Any] = field(default_factory=dict)
-    components: dict[str, "ComponentConfig"] | list["ComponentConfig"] = field(
+    components: dict[str, ComponentConfig] | list[ComponentConfig] = field(
         default_factory=dict
     )
 
@@ -96,7 +128,7 @@ class ComponentVariantConfig:
         data: Mapping[str, Any],
         config_path: str,
         ctype: ComponentType,
-    ) -> "ComponentVariantConfig":
+    ) -> ComponentVariantConfig:
         data = _validate_mapping(data, config_path)
 
         unknown = set(data).difference({"params", "components"})
@@ -133,7 +165,7 @@ class ComponentConfig:
     ctype: ComponentType
     type: str | None = None
     params: dict[str, Any] = field(default_factory=dict)
-    components: dict[str, "ComponentConfig"] | list["ComponentConfig"] = field(
+    components: dict[str, ComponentConfig] | list[ComponentConfig] = field(
         default_factory=dict
     )
     variants: dict[str, ComponentVariantConfig] = field(default_factory=dict)
@@ -144,7 +176,7 @@ class ComponentConfig:
         data: Mapping[str, Any],
         ctype: ComponentType | str,
         config_path: str = "component",
-    ) -> "ComponentConfig":
+    ) -> ComponentConfig:
         data = _validate_mapping(data, config_path)
 
         if ctype is None:
@@ -192,7 +224,7 @@ class ComponentConfig:
             variants=variants,
         )
 
-    def variant(self, name: str) -> "ComponentConfig":
+    def variant(self, name: str) -> ComponentConfig:
         try:
             variant = self.variants[name]
         except KeyError as err:
@@ -265,7 +297,8 @@ class ExperimentConfig:
     outdir: str | Path | None
     components: dict[ComponentType, ComponentConfig]
     runtime: dict[str, Any] = field(default_factory=dict)
-    saving: list[dict] | None = None
+    monitoring: Mapping = field(default_factory=dict)
+    callbacks: list[CallbackConfig] = field(default_factory=list)
 
     @property
     def project(self) -> str:
@@ -289,10 +322,19 @@ class ExperimentConfig:
         if outdir and not os.path.isdir(outdir):
             raise ConfigurationError("Provided `outdir` must be actual dir")
 
-        # Has default policy
-        saving_policy = data.get("saving", None)
-        if saving_policy:
-            _validate_nested_components(saving_policy, "saving")
+        # Monitoring
+        # По идее вспомогательный компонент, может быть не передан, тогда будет дефолтный
+        monitoring = data.get("monitoring", None)
+        if monitoring:
+            _validate_mapping(monitoring, "monitoring")
+
+        callbacks = data.get("callbacks", None)
+        if callbacks:
+            _validate_nested_components(callbacks, "callbacks")
+            callbacks: list[CallbackConfig] = [
+                CallbackConfig.from_dict(item, f"callbacks[{index}]")
+                for index, item in enumerate(callbacks)
+            ]
 
         # Must be set
         components = data.get("components")
@@ -323,7 +365,8 @@ class ExperimentConfig:
             outdir=outdir,
             components=parsed_components,
             runtime=runtime,
-            saving=saving_policy,
+            monitoring=monitoring,
+            callbacks=callbacks,
         )
 
     @staticmethod
@@ -365,10 +408,17 @@ class ExperimentConfig:
 
         result["name"] = self.name
         result["task"] = self.task.value
-        result["saving"] = self.saving
         result["outdir"] = str(self.outdir)
+
+        if self.monitoring:
+            result["monitoring"] = self.monitoring
+
+        if self.callbacks:
+            result["callbacks"] = [cb.to_dict() for cb in self.callbacks]
+
         if self.runtime:
             result["runtime"] = dict(self.runtime)
+
         return result
 
     def __str__(self):

@@ -20,3 +20,7 @@ class ConfigurationError(CoreError):
 
 class BuildComponentError(CoreError):
     """Raised when component buildings fails"""
+
+
+class BuildCallbackError(CoreError):
+    """Raised when callback buildings fails"""

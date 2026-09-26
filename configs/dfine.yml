@@ -67,18 +67,33 @@ components:
     params:
       num_warmup_steps: 200
 
-saving:
+monitoring:
   monitors:
-    - name: best
-      filename: best.pth
-      monitor: average_metrics.AP50:95
+    - name: best_ap
+      metric_name: average_metrics.AP50:95
       mode: max
+      min_delta: 0.0
 
-  save_last: true
-  last_filename: "last.pth"
+callbacks:
+  - type: saving
+    params:
+      targets:
+        - monitor: best_ap        # subscribe by monitor NAME
+          filename: best.pth
+
+  
+  - type: early_stop
+    params:
+      patience: 5
+
+  - type: stop_policy
+    params:
+      trigger_epoch: 80
+      disable_augm_list: ["photometric_distort", "random_iou_crop", "affine"]
+      disable_mix_augm: true
 
 runtime:
-  epochs: 10
+  epochs: 100
   grad_clip: 0.1
   visualize: true
   print_freq: 250

@@ -1,5 +1,5 @@
 from mlcore.core import Task
-from ._solver import BaseSolver
+from .solver import BaseSolver
 from .segmentation import SegmentationSolver
 from .detection import DetectionSolver
 

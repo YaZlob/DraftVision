@@ -19,6 +19,12 @@ components:
             img_dir: /object_detection/coco2017/train2017
             annotation: /object_detection/coco2017/annotations/instances_train2017.json
             map_coco: "${map_coco}"
+            mix_transform_config:
+              type: cutmix
+              params:
+                p: 0.3
+                alpha: 1.0
+                target_HW: "${resolution}"
           components:
             transforms:
               type: compose
