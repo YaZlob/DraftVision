@@ -58,6 +58,8 @@ class DFINEPostProcessor(nn.Module):
                 dim=1, index=index.unsqueeze(-1).repeat(1, 1, bbox_pred.shape[-1])
             )
 
+        # Legacy from original DETR, modern aproached such as DFine use focal loss by default.
+        # Also focall loss not required additional class for background
         else:
             scores = F.softmax(logits)[:, :, :-1]
             scores, labels = scores.max(dim=-1)
@@ -83,3 +85,55 @@ class DFINEPostProcessor(nn.Module):
         self.eval()
         self.deploy_mode = True
         return self
+
+
+class DFINEPosePostPorcesor(nn.Module):
+    def __init__(
+        self,
+        num_kps=17,
+        num_person=100,
+    ) -> None:
+        super().__init__()
+        self.num_kps = num_kps
+        self.num_person = num_person
+
+        self.deploy_mode = False
+
+    def forward(
+        self, outputs: dict[str, torch.Tensor], orig_target_sizes: torch.Tensor
+    ):
+        logits, boxes, keypoints = (
+            outputs["pred_logits"],
+            outputs["pred_boxes"],
+            outputs["pred_keypoints"],
+        )
+
+        # [B, 1, 2]
+        scale = orig_target_sizes.unsqueeze(1)
+
+        bbox_pred = torchvision.ops.box_convert(boxes, in_fmt="cxcywh", out_fmt="xyxy")
+        bbox_pred = bbox_pred * scale.repeat(1, 1, 2)
+        keypoints_pred = keypoints[:, :, :, :2] * scale.repeat(
+            1, self.num_kps, 1
+        ).unsqueeze(1)
+
+        scores = F.sigmoid(logits)
+        scores, index = torch.topk(scores.flatten(1), self.num_person, dim=-1)
+
+        boxes = bbox_pred.gather(
+            dim=1, index=index.unsqueeze(-1).repeat(1, 1, bbox_pred.shape[-1])
+        )
+        print(index.shape)
+        keypoints = keypoints_pred.gather(dim=1, index=index.unsqueeze())
+
+        # TODO for onnx export
+        if self.deploy_mode:
+            return scores, boxes, keypoints_pred
+
+        # TODO доделать с индексом
+        results = []
+        for lab, box, sco in zip(labels, boxes, scores):
+            result = dict(labels=lab, boxes=box, scores=sco)
+            results.append(result)
+
+        return results

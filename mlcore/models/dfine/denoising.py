@@ -135,3 +135,6 @@ def get_contrastive_denoising_training_group(
     }
 
     return input_query_logits, input_query_bbox_unact, attn_mask, dn_meta
+
+
+def get_contrastive_denoising_training_group_pose(): ...

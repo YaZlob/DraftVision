@@ -4,7 +4,6 @@ Copyright(c) 2023 lyuwenyu. All Rights Reserved.
 """
 
 import os
-import PIL
 import numpy as np
 import torch
 import torch.utils.data
@@ -13,15 +12,19 @@ from torchvision.ops import box_convert
 from torchvision.transforms.functional import to_pil_image
 from pathlib import Path
 from PIL import ImageDraw, ImageFont
+from mlcore.data._contracts import DetectionTarget, PoseTarget
 
 torchvision.disable_beta_transforms_warning()
 
-__all__ = ["show_sample", "save_samples"]
+__all__ = ["save_samples"]
+
+# TODO аналогичго для Pose
 
 
+# TODO переписать для 1 изображения и detTarget
 def save_samples(
     samples: torch.Tensor,
-    targets: list[dict],
+    targets: list[DetectionTarget],
     output_dir: str,
     split: str,
     normalized: bool,
@@ -124,3 +127,12 @@ def save_samples(
 
         save_path = Path(output_dir) / f"{split}_samples" / f"{target_image_id}.webp"
         sample_visualization.save(save_path)
+
+
+def save_skels(
+    sample: torch.Tensor,
+    targets: list[PoseTarget],
+    output_dir: str,
+    split: str,
+    normalized: bool,
+): ...

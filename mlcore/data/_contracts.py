@@ -10,6 +10,14 @@ class DetectionTarget(TypedDict):
     orig_size: torch.Tensor
 
 
+class PoseTarget(TypedDict):
+    image_id: torch.Tensor
+    orig_size: torch.Tensor
+    keypoints: tv_tensors.KeyPoints
+    boxes: tv_tensors.BoundingBoxes
+    vis_mask: torch.Tensor
+
+
 def load_yolo_ann(path2ann: str) -> tuple[list[int], list[tuple]]:
     labels, boxes = [], []
     with open(path2ann, mode="r", encoding="utf-8") as f:
@@ -32,6 +40,38 @@ def _value2tensor(
     return elem
 
 
+# TODO Универсальная функция для N точек, сейчас ожидается 17
+# TODO возможно входные параметры будут пустые, сейчас фильтруется.
+# TODO добавить label = 0
+def _prepare_pose_target(
+    *,
+    boxes: list[list[int]],
+    keypoints: list[list[int]],
+    img_wh: tuple[int, int],
+    image_id: int,
+) -> PoseTarget:
+
+    kps_tensor = torch.Tensor(keypoints).reshape(-1, 17, 3)
+    kps_xy = kps_tensor[:, :, :2]
+    kps_mask = kps_tensor[:, :, 2].bool()
+
+    boxes = tv_tensors.BoundingBoxes(
+        torch.Tensor(boxes),
+        format="xyxy",
+        canvas_size=img_wh[::-1],
+    )
+    keypoints = tv_tensors.KeyPoints(kps_xy, canvas_size=img_wh[::-1])
+
+    target = PoseTarget(
+        image_id=image_id,
+        orig_size=img_wh,
+        keypoints=keypoints,
+        boxes=boxes,
+        vis_mask=kps_mask,
+    )
+    return target
+
+
 # https://docs.pytorch.org/vision/main/generated/torchvision.tv_tensors.BoundingBoxes.html
 def _prepare_det_target(
     *,
@@ -46,7 +86,7 @@ def _prepare_det_target(
         labels=_value2tensor(labels, (0,)).long(),
         # canvas expects h, w as input
         boxes=tv_tensors.BoundingBoxes(
-            _value2tensor(boxes, (0, 4)),
+            _value2tensor(boxes, shape=(0, 4)),
             format=in_box_fmt,
             canvas_size=img_wh[::-1],
         ),

@@ -10,6 +10,7 @@ import copy
 import math
 import functools
 from collections import OrderedDict
+from collections.abc import Callable
 
 import torch
 import torch.nn as nn
@@ -57,7 +58,8 @@ class MSDeformableAttention(nn.Module):
         offset_scale=0.5,
     ):
         """Multi-Scale Deformable Attention"""
-        super(MSDeformableAttention, self).__init__()
+        super().__init__()
+
         self.embed_dim = embed_dim
         self.num_heads = num_heads
         self.num_levels = num_levels
@@ -71,11 +73,13 @@ class MSDeformableAttention(nn.Module):
 
         self.num_points_list = num_points_list
 
+        # [3 x 1/3, 6 x 1/6, 3x1/3], равномерно распределяет предсказанные сдвиги
         num_points_scale = [1 / n for n in num_points_list for _ in range(n)]
         self.register_buffer(
             "num_points_scale", torch.tensor(num_points_scale, dtype=torch.float32)
         )
 
+        # 8 * sum([3, 6, 3]) = 96
         self.total_points = num_heads * sum(num_points_list)
         self.method = method
 
@@ -84,6 +88,7 @@ class MSDeformableAttention(nn.Module):
             self.head_dim * num_heads == self.embed_dim
         ), "embed_dim must be divisible by num_heads"
 
+        # Predicts 2D spatial offsets. Out num_points x 2 (devide num_points to xy)
         self.sampling_offsets = nn.Linear(embed_dim, self.total_points * 2)
         self.attention_weights = nn.Linear(embed_dim, self.total_points)
 
@@ -124,7 +129,7 @@ class MSDeformableAttention(nn.Module):
         reference_points: torch.Tensor,
         value: torch.Tensor,
         value_spatial_shapes: list[int],
-    ):
+    ) -> torch.Tensor:
         """
         Args:
             query (Tensor): [bs, query_length, C]
@@ -138,11 +143,16 @@ class MSDeformableAttention(nn.Module):
         """
         bs, Len_q = query.shape[:2]
 
+        # Linear layer hidden_dim x total_points * 2
+        # B, numQ, hid_dim > B, numQ, total_points * 2
         sampling_offsets: torch.Tensor = self.sampling_offsets(query)
+        # B, numQ, 8, 12, 2
         sampling_offsets = sampling_offsets.reshape(
             bs, Len_q, self.num_heads, sum(self.num_points_list), 2
         )
 
+        # Linear layer hidden_dim x total_points
+        # B, numQ, hid_dim -> B, numQ, total_points -> B, numQ, Heads, 12
         attention_weights = self.attention_weights(query).reshape(
             bs, Len_q, self.num_heads, sum(self.num_points_list)
         )
@@ -150,23 +160,25 @@ class MSDeformableAttention(nn.Module):
 
         if reference_points.shape[-1] == 2:
             offset_normalizer = torch.tensor(value_spatial_shapes)
+            # Changes [H, W] -> [W, H] -> [1, 1, 1, 3, 1, 2]
             offset_normalizer = offset_normalizer.flip([1]).reshape(
                 1, 1, 1, self.num_levels, 1, 2
             )
+            # Potential dim mismatch num_heads = 8, num_levels = 3
+            # [B, numQ, 1, 3, 1, 2] +  [B, numQ, num_heads, -1, 2] / [1, 1, 1, 3, 1, 2]
             sampling_locations = (
                 reference_points.reshape(bs, Len_q, 1, self.num_levels, 1, 2)
                 + sampling_offsets / offset_normalizer
             )
         elif reference_points.shape[-1] == 4:
-            # reference_points [8, 480, None, 1,  4]
-            # sampling_offsets [8, 480, 8,    12, 2]
             num_points_scale = self.num_points_scale.to(dtype=query.dtype).unsqueeze(-1)
             offset = (
-                sampling_offsets
-                * num_points_scale
-                * reference_points[:, :, None, :, 2:]
-                * self.offset_scale
+                sampling_offsets  # [B, numQ, 8, 12, 2]
+                * num_points_scale  # [12, 1]
+                * reference_points[:, :, None, :, 2:]  # [B, numQ, 1, 1, 2]
+                * self.offset_scale  # [1]
             )
+            # [B, numQ, 1, 1, 2] + [B, numQ, 1, 1, 2] -> cxcy + offsets
             sampling_locations = reference_points[:, :, None, :, :2] + offset
         else:
             raise ValueError(
@@ -175,6 +187,11 @@ class MSDeformableAttention(nn.Module):
                 )
             )
 
+        # value -> [B, numQ, hid_dim]
+        # value_spatial_shapes -> [[80, 80], [40, 40], [20, 20]]
+        # sampling_locations -> [B, numQ, 8, 12, 2]
+        # attention_weights -> [B, numQ, Heads, 12]
+        # self.num_points_list -> [3, 6, 3]
         output = self.ms_deformable_attn_core(
             value,
             value_spatial_shapes,
@@ -199,7 +216,20 @@ class TransformerDecoderLayer(nn.Module):
         cross_attn_method="default",
         layer_scale=None,
     ):
-        super(TransformerDecoderLayer, self).__init__()
+        """_summary_
+
+        Args:
+            d_model (int, optional): _description_. Defaults to 256.
+            n_head (int, optional): _description_. Defaults to 8.
+            dim_feedforward (int, optional): _description_. Defaults to 1024.
+            dropout (float, optional): _description_. Defaults to 0.0.
+            activation (str, optional): _description_. Defaults to "relu".
+            n_levels (int, optional): _description_. Defaults to 4.
+            n_points (int, optional): _description_. Defaults to 4.
+            cross_attn_method (str, optional): _description_. Defaults to "default".
+            layer_scale (_type_, optional): _description_. Defaults to None.
+        """
+        super().__init__()
         if layer_scale is not None:
             dim_feedforward = round(layer_scale * dim_feedforward)
             d_model = round(layer_scale * d_model)
@@ -242,13 +272,27 @@ class TransformerDecoderLayer(nn.Module):
 
     def forward(
         self,
-        target,
-        reference_points,
-        value,
-        spatial_shapes,
-        attn_mask=None,
-        query_pos_embed=None,
-    ):
+        target: torch.Tensor,
+        reference_points: torch.Tensor,
+        value: list[torch.Tensor],
+        spatial_shapes: list,
+        attn_mask: torch.Tensor | None = None,
+        query_pos_embed: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Transformer decoder layer forwad function
+
+        Args:
+            target (torch.Tensor): topK queries [B, numQ, hid_dim]
+            reference_points (torch.Tensor): [B, numQ, 1, 4]
+            value (list[torch.Tensor]): [B, num_heads, K, spatial_size], where spatial size in [6400, 1600, 400]
+            spatial_shapes (list): [[80x80], [40x40], [20x20]]
+            attn_mask (torch.Tensor, optional): _description_. Defaults to None.
+            query_pos_embed (torch.Tensor, optional): _description_. Defaults to None.
+
+        Returns:
+            torch.Tensor: _description_
+        """
+
         # self attention
         q = k = self.with_pos_embed(target, query_pos_embed)
 
@@ -276,7 +320,7 @@ class TransformerDecoderLayer(nn.Module):
 
 class Gate(nn.Module):
     def __init__(self, d_model):
-        super(Gate, self).__init__()
+        super().__init__()
         self.gate = nn.Linear(2 * d_model, 2 * d_model)
         bias = bias_init_with_prob(0.5)
         init.constant_(self.gate.bias, bias)
@@ -304,7 +348,7 @@ class Integral(nn.Module):
     """
 
     def __init__(self, reg_max=32):
-        super(Integral, self).__init__()
+        super().__init__()
         self.reg_max = reg_max
 
     def forward(self, x, project):
@@ -316,7 +360,7 @@ class Integral(nn.Module):
 
 class LQE(nn.Module):
     def __init__(self, k, hidden_dim, num_layers, reg_max):
-        super(LQE, self).__init__()
+        super().__init__()
         self.k = k
         self.reg_max = reg_max
         self.reg_conf = MLP(4 * (k + 1), hidden_dim, 1, num_layers)
@@ -343,24 +387,52 @@ class TransformerDecoder(nn.Module):
 
     def __init__(
         self,
-        hidden_dim,
-        decoder_layer,
-        decoder_layer_wide,
-        num_layers,
-        num_head,
-        reg_max,
-        reg_scale,
-        up,
+        hidden_dim: int,
+        num_head: int,
+        dim_feedforward: int,
+        dropout: float,
+        activation: str,
+        num_levels: int,
+        num_points: int,
+        cross_attn_method: str,
+        num_layers: int,
+        reg_max: int,
+        reg_scale: float,
+        up: torch.Tensor,
         eval_idx=-1,
         layer_scale=2,
     ):
-        super(TransformerDecoder, self).__init__()
+        super().__init__()
         self.hidden_dim = hidden_dim
         self.num_layers = num_layers
         self.layer_scale = layer_scale
         self.num_head = num_head
         self.eval_idx = eval_idx if eval_idx >= 0 else num_layers + eval_idx
         self.up, self.reg_scale, self.reg_max = up, reg_scale, reg_max
+
+        decoder_layer = TransformerDecoderLayer(
+            hidden_dim,
+            num_head,
+            dim_feedforward,
+            dropout,
+            activation,
+            num_levels,
+            num_points,
+            cross_attn_method=cross_attn_method,
+        )
+
+        decoder_layer_wide = TransformerDecoderLayer(
+            hidden_dim,
+            num_head,
+            dim_feedforward,
+            dropout,
+            activation,
+            num_levels,
+            num_points,
+            cross_attn_method=cross_attn_method,
+            layer_scale=layer_scale,
+        )
+
         self.layers = nn.ModuleList(
             [copy.deepcopy(decoder_layer) for _ in range(self.eval_idx + 1)]
             + [
@@ -373,10 +445,26 @@ class TransformerDecoder(nn.Module):
         )
 
     def value_op(
-        self, memory, value_proj, value_scale, memory_mask, memory_spatial_shapes
-    ):
-        """
-        Preprocess values for MSDeformableAttention.
+        self,
+        memory: torch.Tensor,
+        value_proj: Callable | None,
+        value_scale: Callable | None,
+        memory_mask: torch.Tensor | None,
+        memory_spatial_shapes: list,
+    ) -> tuple[torch.Tensor]:
+        """Preprocess values for MSDeformableAttention.
+
+        Args:
+            memory (torch.Tensor): flattened multi-scale feature maps
+            value_proj (Callable | None): _description_
+            value_scale (Callable | None): _description_
+            memory_mask (torch.Tensor | None): Was already applied before?
+            memory_spatial_shapes (list): fe
+
+        Returns:
+            tuple[torch.Tensor]: multi-scale feature maps for Transformer input.
+                Tensor with shape [B, num_heads, N, F], where N * num_heads = hidden_dim,
+                F - feature map resolution
         """
         value = value_proj(memory) if value_proj is not None else memory
         value = (
@@ -401,41 +489,61 @@ class TransformerDecoder(nn.Module):
 
     def forward(
         self,
-        target,
-        ref_points_unact,
-        memory,
-        spatial_shapes,
-        bbox_head,
-        score_head,
-        query_pos_head,
-        pre_bbox_head,
-        integral,
-        up,
-        reg_scale,
-        attn_mask=None,
-        memory_mask=None,
-        dn_meta=None,
+        target: torch.Tensor,
+        ref_points_unact: torch.Tensor,
+        memory: torch.Tensor,
+        spatial_shapes: list,
+        bbox_head: nn.Module,
+        score_head: nn.Module,
+        query_pos_head: nn.Module,
+        pre_bbox_head: nn.Module,
+        integral: nn.Module,
+        attn_mask: torch.Tensor | None = None,
+        memory_mask: torch.Tensor | None = None,
+        dn_meta: dict | None = None,
     ):
+        """Forward pass Fine-grained Distribution Refinement layer
+
+        Args:
+            target (torch.Tensor): topK quries with shape [B, num_queries, hid_dim]
+            ref_points_unact (torch.Tensor): predicted boxes from encoder,
+                based on `target` with shape [B, num_quries, 4]
+            memory (torch.Tensor): flattened multi-scale feature maps [B, F, hid_dim],
+                F denotes to features map resolitions projection
+            spatial_shapes (list): multi-scale feature maps size
+            bbox_head (nn.Module): FFN for box predictions
+            score_head (nn.Module): FFN for score predictions
+            query_pos_head (nn.Module): FFN Restores reference points latent dim back into hidden_dim.
+                preprocess for deformable_attention
+            pre_bbox_head (nn.Module): FFN for box predictions
+            integral (nn.Module): A static layer that calculates integral results from a distribution.
+            attn_mask (torch.Tensor, optional): attn_mask from contrastive denoising. Defaults to None.
+            memory_mask (torch.Tensor, optional): _description_. Defaults to None.
+            dn_meta (dict | None, optional): _description_. Defaults to None.
+
+        Returns:
+            _type_: _description_
+        """
         output = target
         output_detach = pred_corners_undetach = 0
         value = self.value_op(memory, None, None, memory_mask, spatial_shapes)
 
-        dec_out_bboxes = []
-        dec_out_logits = []
-        dec_out_pred_corners = []
-        dec_out_refs = []
+        dec_out_bboxes, dec_out_logits = [], []
+        dec_out_pred_corners, dec_out_refs = [], []
+
         if not hasattr(self, "project"):
-            project = weighting_function(self.reg_max, up, reg_scale)
+            project = weighting_function(self.reg_max, self.up, self.reg_scale)
         else:
             project = self.project
 
+        # predicted boxes from topK mem + enc_topK_anchors
+        # Forces coordinates to be in [0..1], shape [B, num_quries, 4]
         ref_points_detach = F.sigmoid(ref_points_unact)
 
         for i, layer in enumerate(self.layers):
             ref_points_input = ref_points_detach.unsqueeze(2)
             query_pos_embed = query_pos_head(ref_points_detach).clamp(min=-10, max=10)
 
-            # TODO Adjust scale if needed for detachable wider layers
             if i >= self.eval_idx + 1 and self.layer_scale > 1:
                 query_pos_embed = F.interpolate(
                     query_pos_embed, scale_factor=self.layer_scale
@@ -464,9 +572,10 @@ class TransformerDecoder(nn.Module):
                 ref_points_initial = pre_bboxes.detach()
 
             # Refine bounding box corners using FDR, integrating previous layer's corrections
+            # pred corners shape B, num_quries, 132 (32 * 4)
             pred_corners = bbox_head[i](output + output_detach) + pred_corners_undetach
             inter_ref_bbox = distance2bbox(
-                ref_points_initial, integral(pred_corners, project), reg_scale
+                ref_points_initial, integral(pred_corners, project), self.reg_scale
             )
 
             if self.training or i == self.eval_idx:
@@ -514,6 +623,7 @@ class DFINETransformer(nn.Module):
         num_layers=6,
         dim_feedforward=1024,
         dropout=0.0,
+        grid_size: float = 0.05,
         activation="relu",
         num_denoising=100,
         label_noise_ratio=0.5,
@@ -537,8 +647,9 @@ class DFINETransformer(nn.Module):
         for _ in range(num_levels - len(feat_strides)):
             feat_strides.append(feat_strides[-1] * 2)
 
+        self.grid_size = grid_size
         self.hidden_dim = hidden_dim
-        scaled_dim = round(layer_scale * hidden_dim)
+
         self.nhead = nhead
         self.feat_strides = feat_strides
         self.feat_channels = feat_channels
@@ -567,33 +678,17 @@ class DFINETransformer(nn.Module):
         # Transformer module
         self.up = nn.Parameter(torch.tensor([0.5]), requires_grad=False)
         self.reg_scale = nn.Parameter(torch.tensor([reg_scale]), requires_grad=False)
-        decoder_layer = TransformerDecoderLayer(
-            hidden_dim,
-            nhead,
-            dim_feedforward,
-            dropout,
-            activation,
-            num_levels,
-            num_points,
-            cross_attn_method=cross_attn_method,
-        )
-        decoder_layer_wide = TransformerDecoderLayer(
-            hidden_dim,
-            nhead,
-            dim_feedforward,
-            dropout,
-            activation,
-            num_levels,
-            num_points,
-            cross_attn_method=cross_attn_method,
-            layer_scale=layer_scale,
-        )
+
         self.decoder = TransformerDecoder(
             hidden_dim,
-            decoder_layer,
-            decoder_layer_wide,
-            num_layers,
             nhead,
+            dim_feedforward,
+            dropout,
+            activation,
+            num_levels,
+            num_points,
+            cross_attn_method,
+            num_layers,
             reg_max,
             self.reg_scale,
             self.up,
@@ -638,6 +733,7 @@ class DFINETransformer(nn.Module):
         self.enc_bbox_head = MLP(hidden_dim, hidden_dim, 4, 3)
 
         # decoder head
+        scaled_dim = round(layer_scale * hidden_dim)
         self.eval_idx = eval_idx if eval_idx >= 0 else num_layers + eval_idx
         self.dec_score_head = nn.ModuleList(
             [nn.Linear(hidden_dim, num_classes) for _ in range(self.eval_idx + 1)]
@@ -786,7 +882,19 @@ class DFINETransformer(nn.Module):
                 )
                 in_channels = self.hidden_dim
 
-    def _get_encoder_input(self, feats: list[torch.Tensor]):
+    def _get_encoder_input(
+        self, feats: list[torch.Tensor]
+    ) -> tuple[torch.Tensor, list[list]]:
+        """Prepare encoder inputs for next processing
+
+        Args:
+            feats (list[torch.Tensor]): multi-scale feature maps
+
+        Returns:
+            tuple[torch.Tensor, list[list]]:
+                feat_flatten - flattened multi-scale feature maps\n
+                spatial_shapes: multi-scale feature maps size
+        """
         # get projection features
         proj_feats = [self.input_proj[i](feat) for i, feat in enumerate(feats)]
         if self.num_levels > len(proj_feats):
@@ -812,8 +920,20 @@ class DFINETransformer(nn.Module):
         return feat_flatten, spatial_shapes
 
     def _generate_anchors(
-        self, spatial_shapes=None, grid_size=0.05, dtype=torch.float32, device="cpu"
-    ):
+        self, spatial_shapes=None, dtype=torch.float32, device="cpu"
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Generated anchors for input multi-scale feature maps
+
+        Args:
+            spatial_shapes (list[tuple], optional): multi-scale feature maps size. Defaults to None.
+            dtype (torch.dtype, optional): Memory dtype. Defaults to torch.float32.
+            device (str, optional): Memory device. Defaults to "cpu".
+
+        Returns:
+            tuple:
+                anchors (torch.Tensor): cx, cy, w, h for each scale in feature maps\n
+                valid_mask (torch.Tensor): valid w, h size for each scale
+        """
         if spatial_shapes is None:
             spatial_shapes = []
             eval_h, eval_w = self.eval_spatial_size
@@ -827,7 +947,7 @@ class DFINETransformer(nn.Module):
             )
             grid_xy = torch.stack([grid_x, grid_y], dim=-1)
             grid_xy = (grid_xy.unsqueeze(0) + 0.5) / torch.tensor([w, h], dtype=dtype)
-            wh = torch.ones_like(grid_xy) * grid_size * (2.0**lvl)
+            wh = torch.ones_like(grid_xy) * self.grid_size * (2.0**lvl)
             lvl_anchors = torch.concat([grid_xy, wh], dim=-1).reshape(-1, h * w, 4)
             anchors.append(lvl_anchors)
 
@@ -843,10 +963,28 @@ class DFINETransformer(nn.Module):
     def _get_decoder_input(
         self,
         memory: torch.Tensor,
-        spatial_shapes,
-        denoising_logits=None,
-        denoising_bbox_unact=None,
-    ):
+        spatial_shapes: list[tuple],
+        denoising_logits: torch.Tensor | None = None,
+        denoising_bbox_unact: torch.Tensor | None = None,
+    ) -> tuple:
+        """Generates decoder input from flattened multi-scale feature maps.
+            All shapes for standard tensor input resolution 640x640 \n
+        Args:
+            memory (torch.Tensor): Flattened memory with shape [B, 8400, C] \n
+            spatial_shapes (list[tuple]): features map scale, 80x80, 40x40, 20x20 \n
+            denoising_logits (torch.Tensor, optional): _description_. Defaults to None. \n
+            denoising_bbox_unact (torch.Tensor, optional): _description_. Defaults to None. \n
+
+        Returns:
+            tuple:
+                content (torch.Tensor), top K queries from memory [B, num_queries + num_denoising, C] +
+                 denoising_logist if provided. Note, denoising part comes first \n
+                enc_topk_bbox_unact (torch.Tensor) top K boxes predicted from top K queries \n
+                enc_topk_bboxes_list (list), Sigmoid applyed to `enc_topk_bbox_unact` \n
+                enc_topk_logits_list (list), Top K preidcted logits [B, num_queries, num_cls] \n
+
+        """
+
         # prepare input for decoder
         if self.training or self.eval_spatial_size is None:
             anchors, valid_mask = self._generate_anchors(
@@ -858,8 +996,6 @@ class DFINETransformer(nn.Module):
         if memory.shape[0] > 1:
             anchors = anchors.repeat(memory.shape[0], 1, 1)
 
-        # memory = torch.where(valid_mask, memory, 0)
-        # TODO fix type error for onnx export
         memory = valid_mask.to(memory.dtype) * memory
 
         output_memory: torch.Tensor = self.enc_output(memory)
@@ -879,16 +1015,12 @@ class DFINETransformer(nn.Module):
             enc_topk_bboxes_list.append(enc_topk_bboxes)
             enc_topk_logits_list.append(enc_topk_logits)
 
-        # if self.num_select_queries != self.num_queries:
-        #     raise NotImplementedError('')
-
         if self.learn_query_content:
             content = self.tgt_embed.weight.unsqueeze(0).tile([memory.shape[0], 1, 1])
         else:
             content = enc_topk_memory.detach()
 
         enc_topk_bbox_unact = enc_topk_bbox_unact.detach()
-
         if denoising_bbox_unact is not None:
             enc_topk_bbox_unact = torch.concat(
                 [denoising_bbox_unact, enc_topk_bbox_unact], dim=1
@@ -903,7 +1035,19 @@ class DFINETransformer(nn.Module):
         outputs_logits: torch.Tensor,
         outputs_anchors_unact: torch.Tensor,
         topk: int,
-    ):
+    ) -> tuple:
+        """Select top K queries from Encoder output.
+        All shapes for standard tensor input resolution 640x640 \n
+
+        Args:
+            memory (torch.Tensor): Flattened memory with shape [B, 8400, C]
+            outputs_logits (torch.Tensor): Linear layer over `memory` [B, 8400, num_cls]
+            outputs_anchors_unact (torch.Tensor): Anchors from `_generate_anchors`, with shape [B, 8400, 4]
+            topk (int): topK quries number
+
+        Returns:
+            tuple: Selected topK memory, logits, anchors from input memory
+        """
         if self.query_select_method == "default":
             _, topk_ind = torch.topk(outputs_logits.max(-1).values, topk, dim=-1)
 
@@ -982,8 +1126,6 @@ class DFINETransformer(nn.Module):
                 self.query_pos_head,
                 self.pre_bbox_head,
                 self.integral,
-                self.up,
-                self.reg_scale,
                 attn_mask=attn_mask,
                 dn_meta=dn_meta,
             )

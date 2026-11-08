@@ -25,7 +25,7 @@ from mlcore.core import COMPONENTS, ComponentType, Task
 @COMPONENTS.register(
     name="HungarianMatcher",
     ctype=ComponentType.LOSS,
-    supported_tasks=Task.OBJECT_DETECTION,
+    supported_tasks=[Task.OBJECT_DETECTION, Task.POSE_ESTIMATION],
     description="Hungarian Matcher for Detr like object detectors",
 )
 class HungarianMatcher(nn.Module):
@@ -49,6 +49,8 @@ class HungarianMatcher(nn.Module):
         self.cost_bbox = weight_dict["cost_bbox"]
         self.cost_giou = weight_dict["cost_giou"]
 
+        self.cost_kps = weight_dict.get("cost_kps", 0.0)
+
         self.use_focal_loss = use_focal_loss
         self.alpha = alpha
         self.gamma = gamma
@@ -65,6 +67,22 @@ class HungarianMatcher(nn.Module):
             f"Cost giou: {self.cost_giou}\n"
             f"Focal loss: {self.use_focal_loss}, alpha= {self.alpha}, gamma= {self.gamma}"
         )
+
+    # TODO, targets в абсолютных координатах, предикт в относительных !!!
+    def _get_kps_cost(self, targets, kps: torch.Tensor) -> torch.Tensor:
+        tgt_kps = torch.cat([v["keypoints"] for v in targets])  # N, 17, 2
+        kps_vis_mask = (torch.cat([v["vis_mask"] for v in targets]) > 0).bool()  # N, 17
+
+        pred_kps = kps.flatten(0, 1)[..., :2]  # B*numQ, 17, 3
+
+        # [B*numQ, 1, 17, 2] - [1, N, 17, 2] -> [B*numQ, N, 17, 2] -> [B*numQ, N, 17]
+        kps_L1_dist = (pred_kps[:, None, ...] - tgt_kps[None]).abs().sum(-1)
+        vis_kps_dist = kps_L1_dist * kps_vis_mask[None]
+
+        denom = kps_vis_mask.sum(-1).clamp(min=1)[None]  # 1, N
+        norm_kps_dist = vis_kps_dist.sum(-1) / denom
+        # [B*numQ, N]
+        return norm_kps_dist
 
     @torch.no_grad()
     def forward(self, outputs: dict[str, torch.Tensor], targets, return_topk=False):
@@ -134,6 +152,10 @@ class HungarianMatcher(nn.Module):
             + self.cost_class * cost_class
             + self.cost_giou * cost_giou
         )
+        if self.cost_kps and "pred_keypoints" in outputs:
+            kps_dist = self._get_kps_cost(targets, outputs["pred_keypoints"])
+            C = C + kps_dist * self.cost_kps
+
         C = C.view(bs, num_queries, -1).cpu()
 
         sizes = [len(v["boxes"]) for v in targets]
@@ -198,6 +220,8 @@ class HungarianMatcher(nn.Module):
 class DFINECriterion(nn.Module):
     """This class computes the loss for D-FINE."""
 
+    _losses = set(["boxes", "focal", "vfl", "local"])
+
     def __init__(
         self,
         matcher: nn.Module,
@@ -226,6 +250,10 @@ class DFINECriterion(nn.Module):
                 f"{self.__class__.__name__} works only with HungarianMatcher, got {type(matcher)}"
             )
 
+        lossmis = set(losses) - self._losses
+        if lossmis:
+            raise ValueError(f"Unexpected losses {lossmis}, available {self._losses}")
+
         self.num_classes = num_classes
         self.matcher = matcher
         self.weight_dict = weight_dict
@@ -238,6 +266,13 @@ class DFINECriterion(nn.Module):
         self.own_targets, self.own_targets_dn = None, None
         self.reg_max = reg_max
         self.num_pos, self.num_neg = None, None
+
+        self._loss_map = {
+            "boxes": self.loss_boxes,
+            "focal": self.loss_labels_focal,
+            "vfl": self.loss_labels_vfl,
+            "local": self.loss_local,
+        }
 
     def __repr__(self):
         return (
@@ -495,14 +530,7 @@ class DFINECriterion(nn.Module):
         self.num_pos, self.num_neg = None, None
 
     def get_loss(self, loss, outputs, targets, indices, num_boxes, **kwargs):
-        loss_map = {
-            "boxes": self.loss_boxes,
-            "focal": self.loss_labels_focal,
-            "vfl": self.loss_labels_vfl,
-            "local": self.loss_local,
-        }
-        assert loss in loss_map, f"do you really want to compute {loss} loss?"
-        return loss_map[loss](outputs, targets, indices, num_boxes, **kwargs)
+        return self._loss_map[loss](outputs, targets, indices, num_boxes, **kwargs)
 
     def forward(self, outputs, targets, **kwargs):
         """This performs the loss computation.
@@ -809,3 +837,149 @@ class DFINECriterion(nn.Module):
             [0.5 + step * i for i in range(num_layers)] if num_layers > 1 else [1]
         )
         return opt_list
+
+
+# RTMO считает абсолютные координаты для KPS, я относительные, нужно привести к одному формату!
+class DfinePoseCriterion(nn.Module):
+    _losses = set(["boxes", "focal", "l1", "oks"])
+
+    def __init__(
+        self,
+        matcher: HungarianMatcher,
+        weight_dict: dict[str, float],
+        losses: list[str],
+        num_body_points: int = 17,
+        alpha=0.2,
+        gamma=2.0,
+        reg_max=32,
+        boxes_weight_format=None,
+        share_matched_indices=False,
+    ):
+        """Create the criterion.
+        Parameters:
+            matcher: module able to compute a matching between targets and proposals.
+            weight_dict: dict containing as key the names of the losses and as values their relative weight.
+            losses: list of all the losses to be applied. See get_loss for list of available losses.
+            num_classes: number of object categories, omitting the special no-object category.
+            reg_max (int): Max number of the discrete bins in D-FINE.
+            boxes_weight_format: format for boxes weight (iou, ).
+        """
+        super().__init__()
+
+        if not isinstance(matcher, HungarianMatcher):
+            raise ValueError(
+                f"{self.__class__.__name__} works only with HungarianMatcher, got {type(matcher)}"
+            )
+
+        self.matcher = matcher
+        self.weight_dict = weight_dict
+        self.losses = losses
+        self.boxes_weight_format = boxes_weight_format
+        self.share_matched_indices = share_matched_indices
+        self.alpha = alpha
+        self.gamma = gamma
+        self.fgl_targets, self.fgl_targets_dn = None, None
+        self.own_targets, self.own_targets_dn = None, None
+        self.reg_max = reg_max
+        self.num_pos, self.num_neg = None, None
+
+        # COCO
+        if num_body_points == 17:
+            # fmt: off
+            self.sigmas = torch.tensor([
+                0.26, 0.25, 0.25, 0.35, 0.35,
+                0.79, 0.79, 0.72, 0.72, 0.62,
+                0.62, 1.07, 1.07, 0.87, 0.87,
+                0.89, 0.89]) / 10.0
+            # fmt: on
+        else:
+            raise NotImplementedError(f"Unexpected body points num: {num_body_points}")
+
+    def forward(self, predicts, targets: list[dict]):
+        # Assume that predicts keypoints is relative
+        orig_target_sizes = [v["orig_size"] for v in targets]
+
+        relkps = predicts["pred_keypoints"]
+        B, numQ, points, coords = relkps.shape
+        assert coords == 3
+
+        abskps = relkps[..., :2] * orig_target_sizes.repeat(B, numQ, points, 2)
+        predicts["pred_keypoints"][..., :2] = abskps
+
+        indices = self.matcher(predicts, targets)["indices"]
+        num_boxes = sum(len(t["labels"]) for t in targets)
+        num_boxes = torch.as_tensor(
+            [num_boxes], dtype=torch.float, device=abskps.device
+        )
+        pass
+
+    def visloss(self, outputs, targets, indices, num_boxes, boxes_weight=None):
+        """Calculates visiable kps loss"""
+
+    def kpsloss(self, outputs, targets, indices, num_boxes, boxes_weight=None):
+        """Calculates L1 loss for kps"""
+
+    def focallloss(self, output, targets, indices):
+        """Calculate focall loss for scel confidence"""
+
+    def oksloss(self, output, targets, indices):
+        # distances = torch.sum((pred_kpts - gt_kpts) ** 2, dim=-1)  # [B, K]
+
+        # Scale denominator: 2 * (area * (sigma^2))
+        # Expand sigmas to [1, K]
+        # ars_kpt = (self.sigmas * 2) ** 2
+        # denom = 2 * areas.unsqueeze(1) * vars_kpt + self.eps
+        # e = 1.0 - torch.exp(-d2 / (2 * denom))
+        # return (e * vis).sum() / (vis.sum() + self.eps)
+        pass
+
+    # TODO общая для 2х классов
+    def _get_src_permutation_idx(
+        self, indices: list[tuple]
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Extracts source indexes for every batch.
+        By default indices are list of tuples coresponds to best match
+
+        Args:
+            indices (list[tuple]): best matches list
+
+        Returns:
+            tuple[torch.Tensor, torch.Tensor]:
+                batch idx
+                src idx
+
+        Example:
+            indices: [(tensor([1, 3, 4]), tensor([0, 1, 2])), (tensor([0, 3]), tensor([1, 0]))]
+            batch idx: tensor([0, 0, 0, 1, 1])
+            src_idx: tensor([1, 3, 4, 0, 3])
+        """
+        batch_idx = torch.cat(
+            [torch.full_like(src, i) for i, (src, _) in enumerate(indices)]
+        )
+        src_idx = torch.cat([src for (src, _) in indices])
+        return batch_idx, src_idx
+
+    def loss_boxes(self, outputs, targets, indices, num_boxes, boxes_weight=None):
+        """Compute the losses related to the bounding boxes, the L1 regression loss and the GIoU loss
+        targets dicts must contain the key "boxes" containing a tensor of dim [nb_target_boxes, 4]
+        The target boxes are expected in format (center_x, center_y, w, h), normalized by the image size.
+        """
+        assert "pred_boxes" in outputs
+        idx = self._get_src_permutation_idx(indices)
+        src_boxes = outputs["pred_boxes"][idx]
+        target_boxes = torch.cat(
+            [t["boxes"][i] for t, (_, i) in zip(targets, indices)], dim=0
+        )
+        losses = {}
+        loss_bbox = F.l1_loss(src_boxes, target_boxes, reduction="none")
+        losses["loss_bbox"] = loss_bbox.sum() / num_boxes
+
+        loss_giou = 1 - torch.diag(
+            generalized_box_iou(
+                box_cxcywh_to_xyxy(src_boxes), box_cxcywh_to_xyxy(target_boxes)
+            )
+        )
+        loss_giou = loss_giou if boxes_weight is None else loss_giou * boxes_weight
+        losses["loss_giou"] = loss_giou.sum() / num_boxes
+
+        return losses
